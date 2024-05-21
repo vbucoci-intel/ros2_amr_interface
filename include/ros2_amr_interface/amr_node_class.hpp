@@ -101,8 +101,6 @@ class AMR_Node: public rclcpp::Node{
 
         rclcpp::Time timeout_time;
 
-
-        rclcpp::TimerBase::SharedPtr send_timer;
         
         // Subscribers and Publishers
         rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_subscription;
@@ -116,62 +114,59 @@ class AMR_Node: public rclcpp::Node{
         
         std::vector<uint8_t> serial_msg;
         uint8_t dim;
-        bool cmd_is_exec;
+        int cmd_count;
         bool closing_is_exec;
         bool ask_to_close;
 
+        uint32_t last_cmd_time, safety_timeout;
 
         // Callback for /cmd_vel topic subscription
+
+        // Movement data should come at a rate higher than 3Hz to keep
+        // the motors running continuosly.  If data stops coming while
+        // the wheels are moving, stop them after 300ms.
+        //
+        // Arduino firmware disconnects from the serial port (and
+        // stops the robot) after 500ms from the last serial command
+        // (not only movement command). See:
+        // https://github.com/gbr1/stm32_amr_firmware/blob/4da2086300a740a6d3a2575e96c1b40f08209a83/stm32_amr_firmware/stm32_amr_firmware.ino#L393
         void cmd_callback(const geometry_msgs::msg::Twist::SharedPtr msg){
             fik_model.setVelocities(msg->linear.x,msg->linear.y,msg->angular.z);
             fik_model.forward();
             fik_model.getJoints(w_1,w_2,w_3,w_4);
 
-            /*
-            fik_model.getJoints(w1,w2,w3,w4);
-            dim=packeter.packetC4F('J',w1,w2,w3,w4);
-            for(uint8_t i=0; i<dim; i++){
-                serial_msg.push_back(packeter.msg[i]);
-            }
-            cmd_is_exec=false;
-            serial_driver->port()->async_send(serial_msg);
-            send_timer = this->create_wall_timer(1ms, std::bind(&AMR_Node::send_callback, this));
+            last_cmd_time = 0;
 
-            //--------------------------------------------------------------------
             if (extra_verbose){
-                RCLCPP_INFO(this->get_logger(),"sent: %f\t%f\t%f\t%f",w1,w2,w3,w4);
+                RCLCPP_INFO(this->get_logger(),"cmd cb set: %f\t%f\t%f\t%f",w_1,w_2,w_3,w_4);
             }
-            //--------------------------------------------------------------------
-
-            */
         }
 
         // Callback every 10ms to send data via serial to update joints, this begins afert 'e' was decoded
         void send_joints_callback(){
+            if ((last_cmd_time > safety_timeout)
+                && (w_1!=0.0 || w_2!=0.0 || w_3!=0.0 || w_4!=0.0)) {
+
+                // Help for users that publish movement commands at a
+                // lower rate.
+                RCLCPP_ERROR(this->get_logger(),"Timeout for last command on /amr/cmd_vel expired.  Stopping motors.");
+
+                w_1 = w_2 = w_3 = w_4 = 0.0;
+            }
+
             uint8_t dim=packeter.packetC4F('J',w_1,w_2,w_3,w_4);
             for(uint8_t i=0; i<dim; i++){
                 serial_msg.push_back(packeter.msg[i]);
             }
-            cmd_is_exec=false;
+
             serial_driver->port()->async_send(serial_msg);
-            send_timer = this->create_wall_timer(1ms, std::bind(&AMR_Node::send_callback, this));
+            serial_msg.clear();
 
-            //--------------------------------------------------------------------
+            cmd_count++;
+            last_cmd_time++;
+
             if (extra_verbose){
-                RCLCPP_INFO(this->get_logger(),"sent: %f\t%f\t%f\t%f",w_1,w_2,w_3,w_4);
-            }
-            //--------------------------------------------------------------------
-        }
-
-
-        // Callback to resend joint message until ack from hardware
-        void send_callback(){
-            if (!cmd_is_exec){
-                serial_driver->port()->async_send(serial_msg);
-            }
-            else{
-                serial_msg.clear();
-                send_timer->cancel();
+                RCLCPP_INFO(this->get_logger(),"sent: %f\t%f\t%f\t%f %ld %d",w_1,w_2,w_3,w_4,serial_msg.size(),cmd_count);
             }
         }
 
@@ -200,6 +195,9 @@ class AMR_Node: public rclcpp::Node{
             
             while (packeter.checkPayload()){
                 uint8_t c=packeter.payloadTop();
+                if (extra_verbose){
+                  RCLCPP_INFO(this->get_logger(), "serial cb: %c", (char)c);
+                }
                 if (!disable_timeout){
                     timeout_time=this->get_clock()->now();
                 }
@@ -302,7 +300,7 @@ class AMR_Node: public rclcpp::Node{
 
                     // hardware received joint command
                     if (c=='x'){
-                        cmd_is_exec=true;
+                        cmd_count--;
                     }
                 }
 
@@ -831,9 +829,12 @@ class AMR_Node: public rclcpp::Node{
             
             connected = false;
 
-            cmd_is_exec=false;
+            cmd_count=0;
             closing_is_exec=false;
             ask_to_close=false;
+
+            last_cmd_time = 0;
+            safety_timeout = 30; // based on the 10ms period of send_joint_timer
 
             // Parameters
             parameters_declaration();
